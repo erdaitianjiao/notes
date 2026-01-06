@@ -31,7 +31,7 @@ clean:
 
 #### 二、内核数据结构
 
-#####  1. list
+#####  1. list 链表
 
 ###### 定义
 
@@ -44,15 +44,28 @@ struct list_head {
 ###### 操作函数及宏定义
 
 ```c
-LIST_HEAD(name)  	// 用于声明链表的标记（sentinel）
-INIT_LIST_HEAD(struct list_head *list)() 	// 用于在进行动态分配时，通过设置链表字段 next 和 prev，来初始化链表的标记
-list_add(struct list_head *new, struct list_head *head)() 	// 将 new 指针所引用的元素添加到 head 指针所引用的元素之后
-list_del(struct list_head *entry)()  // 删除属于列表的 entry 地址处的项目
-list_entry(ptr, type, member)() 	 // 返回列表中包含元素 ptr 的类型为 type 的结构，该结构中具有名为 member 的成员。
-list_for_each(pos, head) 使用 pos 	// 作为游标来迭代列表
+list
+LIST_HEAD(name)  		// 用于声明链表的标记（sentinel）
+INIT_LIST_HEAD(struct list_head *list) 	// 用于在进行动态分配时，通过设置链表字段 next 和 prev，来初始化链表的标记
+list_add(struct list_head *new, struct list_head *head) 	// 将 new 指针所引用的元素添加到 head 指针所引用的元素之后
+list_del(struct list_head *entry)  	// 删除属于列表的 entry 地址处的项目
+list_entry(ptr, type, member) 	 	// 返回列表中包含元素 ptr 的类型为 type 的结构，该结构中具有名为 member 的成员。
+list_for_each(pos, head) 使用 pos    // 作为游标来迭代列表
+list_for_each_safe(pos, n, head)	// 使用 pos 作为游标，n 作为临时游标来迭代列表。此宏用于从列表中删除项目
 ```
 
-##### 2. spinlock_t
+`list_entry`实现原理
+
+~~~bash
+#define list_entry(ptr, type, member) container_of(ptr, type, member)
+
+#define container_of(ptr, type, member) ({                      \
+        const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
+        (type *)( (char *)__mptr - offsetof(type,member) );})
+# 实际上就是减去偏移地址
+~~~
+
+##### 2. spinlock_t 自旋锁
 
 ###### 定义
 
@@ -84,7 +97,85 @@ spin_lock(&lock2);
 spin_unlock(&lock2);
 ~~~
 
+##### 3. mutex 互斥锁
 
+###### 定义
+
+```c
+struct mutex {
+        atomic_long_t           owner;
+        spinlock_t              wait_lock;
+#ifdef CONFIG_MUTEX_SPIN_ON_OWNER
+        struct optimistic_spin_queue osq; /* Spinner MCS lock */
+#endif
+        struct list_head        wait_list;		// 有一个等待队列
+#ifdef CONFIG_DEBUG_MUTEXES
+        void                    *magic;
+#endif
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+        struct lockdep_map      dep_map;
+#endif
+};
+// 其实是用spinlock实现的
+```
+
+###### 操作方法
+
+```c
+#include <linux/mutex.h>
+
+/* 互斥锁初始化函数 */
+void mutex_init(struct mutex *mutex);
+DEFINE_MUTEX(name);
+
+/* 互斥锁获取函数 */
+void mutex_lock(struct mutex *mutex);
+
+/* 互斥锁释放函数 */
+void mutex_unlock(struct mutex *mutex);
+```
+
+##### 4. acomic_t 原子变量
+
+###### 定义
+
+```c
+typedef struct {
+        int counter;
+} atomic_t;
+// 其实就包含了一个int
+```
+
+###### 操作函数
+
+```c
+#include <asm/atomic.h>
+
+void atomic_set(atomic_t *v, int i);
+int atomic_read(atomic_t *v);
+void atomic_add(int i, atomic_t *v);
+void atomic_sub(int i, atomic_t *v);
+void atomic_inc(atomic_t *v);
+void atomic_dec(atomic_t *v);
+int atomic_inc_and_test(atomic_t *v);
+int atomic_dec_and_test(atomic_t *v);
+int atomic_cmpxchg(atomic_t *v, int old, int new);
+```
+
+原子变量的实现和架构有关，比如在x86架构上，实现的原理就是在汇编上使用lock
+
+###### 原子位操作函数
+
+```c
+#include <asm/bitops.h>
+
+void set_bit(int nr, void *addr);
+void clear_bit(int nr, void *addr);
+void change_bit(int nr, void *addr);
+int test_and_set_bit(int nr, void *addr);
+int test_and_clear_bit(int nr, void *addr);
+int test_and_change_bit(int nr, void *addr);
+```
 
 
 
@@ -163,6 +254,12 @@ flag 参数
 - GFP_ATOMIC ——使用此值确保 kmalloc() 函数不会挂起当前进程。它可以随时使用。
 
 ###### kfree() 释放内存
+
+
+
+#### 五、字符设备驱动
+
+
 
 
 
