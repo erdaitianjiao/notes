@@ -4,57 +4,59 @@
 
 ##### 什么是s4
 
-- 电源管理中的S4 挂载到磁盘(也称休眠)
+电源管理中的S4 挂载到磁盘(也称休眠)
 
-睡眠状态会将机器状态保存到交换空间，并完全关闭机器电源。机器开机后，状态会恢复。在此之前，功耗为零
+睡眠状态会将机器状态保存到交换空间，就是将内存中的内容存入交换空间、并完全关闭机器电源。机器开机后，状态会恢复。在此之前，功耗为零
 
-##### acpi
+##### ACPI (高级配置和电源接口)
 
-休眠中的acpi操作结构体
+ACPI首先可以理解为一个独立于体系结构的电源管理和配置框架，它在主机OS中形成一个子系统。该框架建立一个硬件寄存器集来定义电源状态(休眠、hibernate、唤醒等)。硬件寄存器集可以容纳专用硬件和通用硬件上的操作
 
-```c
-static const struct platform_hibernation_ops *hibernation_ops;
-```
-
-定义
-
-```c
-struct platform_hibernation_ops {
-    int (*begin)(pm_message_t stage);
-    void (*end)(void);
-    int (*pre_snapshot)(void);
-    void (*finish)(void);
-    int (*prepare)(void);
-    int (*enter)(void);
-    void (*leave)(void);
-    int (*pre_restore)(void);
-    void (*restore_cleanup)(void);
-    void (*recover)(void);
-};
-```
-
-赋值
-
-```C
-struct platform_hibernation_ops {
-    int (*begin)(pm_message_t stage);
-    void (*end)(void);
-    int (*pre_snapshot)(void);
-    void (*finish)(void);
-    int (*prepare)(void);
-    int (*enter)(void);
-    void (*leave)(void);
-    int (*pre_restore)(void);
-    void (*restore_cleanup)(void);
-    void (*recover)(void);
-};
-```
+标准ACPI框架和硬件寄存器集的主要目的是启用电源管理和系统配置，无需操作系统来直接调用固件。ACPI作为系统固件(BIOS]和OS之间的接口层
 
 ##### 用户态接口
 
 ```bash
+# 这里主要以reboot为例
 echo reboot > /sys/power/disk
 echo disk > /sys/power/status
+```
+
+#### 重要数据结构
+
+```c
+// 实例化
+static const struct platform_hibernation_ops *hibernation_ops;
+// 这个实例的初始化是在 drivers/acpi/sleep.c 中的 acpi_sleep_init 模块初始化中赋值的
+hibernation_set_ops(old_suspend_ordering ?
+             &acpi_hibernation_ops_old : &acpi_hibernation_ops);
+
+// 定义
+struct platform_hibernation_ops {
+       int (*begin)(pm_message_t stage);
+    void (*end)(void);
+    int (*pre_snapshot)(void);
+    void (*finish)(void);
+    int (*prepare)(void);
+    int (*enter)(void);
+    void (*leave)(void);
+    int (*pre_restore)(void);
+    void (*restore_cleanup)(void);
+    void (*recover)(void);
+};
+
+// 新的apci ops结构体
+static const struct platform_hibernation_ops acpi_hibernation_ops = {
+    .begin = acpi_hibernation_begin, // -> acpi_pm_start - Start system PM transition   
+    .end = acpi_pm_end, // -> acpi_pm_end - Finish up system PM transition.
+    .pre_snapshot = acpi_pm_prepare, // -> acpi_pm_prepare - Prepare the platform to enter the target sleep state and disable the GPEs.
+    .finish = acpi_pm_finish, // -> acpi_pm_finish - Instruct the platform to leave a sleep state / This is called after we wake back up (or if entering the sleep state failed).
+    .prepare = acpi_pm_prepare, // -> acpi_pm_prepare - Prepare the platform to enter the target sleep state and disable the GPEs.
+    .enter = acpi_hibernation_enter, // -> acpi_enter_sleep_state 进入睡眠
+    .leave = acpi_hibernation_leave,
+    .pre_restore = acpi_pm_freeze, // -> acpi_pm_freeze - Disable the GPEs and suspend EC transactions
+    .restore_cleanup = acpi_pm_thaw,
+};
 ```
 
 #### 函数调用流程 
@@ -83,7 +85,7 @@ state_store() {
                 platform_leave():hibernation_ops->leave();
                 local_irq_enable();		// 开中断
                 enable_nonboot_cpus();	// 开启其他cpu
-                platform_finish(platform_mode):hibernation_ops->finish();
+                platform_finish():hibernation_ops->finish();
             }
         }
         swsusp_write();			// 将内存快照写进swap分区
