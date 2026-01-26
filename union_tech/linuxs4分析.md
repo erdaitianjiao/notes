@@ -12,7 +12,7 @@
 
 ACPI首先可以理解为一个独立于体系结构的电源管理和配置框架，它在主机OS中形成一个子系统。该框架建立一个硬件寄存器集来定义电源状态(休眠、hibernate、唤醒等)。硬件寄存器集可以容纳专用硬件和通用硬件上的操作
 
-标准ACPI框架和硬件寄存器集的主要目的是启用电源管理和系统配置，无需操作系统来直接调用固件。ACPI作为系统固件(BIOS]和OS之间的接口层
+标准ACPI框架和硬件寄存器集的主要目的是启用电源管理和系统配置，无需操作系统来直接调用固件。ACPI作为系统固件(BIOS]和OS之间的接口层	
 
 ###### 2.1 协同机制
 
@@ -156,9 +156,91 @@ software_resume() {
 
 ##### 3. 核心代码分析
 
+###### hibernation_snapshot
+
+```c
+int hibernation_snapshot(int platform_mode)
+{
+	...
+    pm_suspend_clear_flags();
+    error = platform_begin(platform_mode);	// 通知 BIOS 准备进入休眠
+    error = hibernate_preallocate_memory();	// 预先分配镜像所需要的内存
+    error = freeze_kernel_threads();		// 冻结内核线程
+    error = dpm_prepare(PMSG_FREEZE);		// 驱动程序休眠准备
+    pm_restrict_gfp_mask();					// 限制内存分配掩码
+    error = dpm_suspend(PMSG_FREEZE);		// 挂起设备 调用驱动的钩子函数，关闭大部分设备
+    
+    if (error || hibernation_test(TEST_DEVICES))
+        platform_recover(platform_mode);	// 挂起失败使用acpi尝试恢复
+    else 
+        error = create_image(platform_mode);	// 执行创建img指令
+    
+    // 恢复的时候从这里开始执行 然后in_suspend这个变量会有区别 用于区分休眠动
+    if (error || !in_suspend)	// 如果是恢复状态 就直接释放预分配的内存 因为不需要
+        swsusp_free();
+	// 确定现在状态
+    msg = in_suspend ? (error ? PMSG_RECOVER : PMSG_THAW) : PMSG_RESTORE;
+    dpm_resume(msg);			// 唤醒驱动程序
+
+    if (error || !in_suspend)	// 允许自由分配内存
+        pm_restore_gfp_mask();
+
+    resume_console();			// 重启控制台
+    dpm_complete(msg);			// 完成驱动设备唤醒
+
+ Close:
+    platform_end(platform_mode);	// 
+    return error;
+
+ Thaw:
+    thaw_kernel_threads();
+ Cleanup:
+    swsusp_free();
+    goto Close;
+}
+
+```
+
+
+
 ##### 4. 重点逻辑分析
 
 reboot的过程是先sync然后冻结所有线程
+
+因为s4的关机是将之前的内存镜像加载重新执行，所以加载完镜像之后会继续执行hibernate这个函数，区分这两个过程的标志是变量in_suspend
+
+逻辑 
+
+```c
+// kernel/power/bibernate.c 743
+if (in_suspend) {
+    ...
+	power_down();
+    ...
+} else {
+	pm_pr_dbg("Image restored successfully.\n");                                                       
+}
+... 
+```
+
+所以是如果in_suspend为1 表示是休眠部分，调用powerdown执行关机命令，如果是0则是恢复部分，后续将执行其他恢复操作
+
+在恢复部分对in_suspend变量的操作是在 
+
+```assembly
+; arch/x86/power/hibernate_asm_64.S 143
+ENTRY(restore_registers)
+	... 
+    movq    %rax, in_suspend(%rip)
+    ret 
+ENDPROC(restore_registers) 
+```
+
+这里将in_suspend设置为0后，回去将能顺利执行恢复部分的代码
+
+##### 5. acpi交互
+
+
 
 #### 三、实验验证分析
 
@@ -166,150 +248,139 @@ reboot的过程是先sync然后冻结所有线程
 
 ##### 1. 整体流程分析
 
-从日志中可以看出这个流程，但是可以注意到这个日志关机部分和开机部分有一部分是重叠的 
+整个的流程就是<br>先sync文件系统，然后先冻结用户线程，关闭OOM killer，然后创建bitmap 记录需要保存的物理页，冻结内核线程，冻结硬件设备，关闭中断，禁用其他cpu，拍摄快照[快照]，创建镜像，启动其他cpu，开启中断，写入镜像，进入关机流程
 
-```
-[   25.284901] PM: freeze of devices complete after 41.165 msecs
-[   25.286311] PM: late freeze of devices complete after 1.297 msecs
-[   25.288994] PM: noirq freeze of devices complete after 1.998 msecs
-[   25.289127] Disabling non-boot CPUs ...
-[   25.303495] smpboot: CPU 1 is now offline
-[   25.313526] smpboot: CPU 2 is now offline
-[   25.324817] smpboot: CPU 3 is now offline
-[   25.325747] PM: Creating hibernation image:
-[   25.325747] PM: Need to copy 39548 pages
-```
-
-整个的流程就是<br>先sync文件系统，然后先冻结用户线程，然后创建bitmap，冻结内核线程，冻结硬件设备，关闭中断，禁用其他cpu，拍摄其他快照，创建镜像，启动其他cpu，开启中断，写入镜像，进入关机流程
-
-开机的时候<br>冻结用户线程，关闭OOMkiller，读取镜像，启动其他cpu，开启中断，开启外设，释放bitmap内存，恢复其他线程，然后推出这个hibernation
+开机的时候<br>冻结用户线程，冻结内核线程，关闭OOMkiller，创建基本bitmap，加载镜像[进入快照]，启动其他cpu，开启中断，开启外设，释放bitmap内存，恢复其他线程，然后退出hibernation
 
 ##### 2. 日志结果
 
 1. 关机日志
 
 ```
-[   25.007741] Adding 2097148k swap on /dev/sdb.  Priority:-2 extents:1 across:2097148k 
-[   25.021742] PM: Hibernation mode set to 'reboot'
-[   25.024514] PM: hibernation entry
-[   25.030407] PM: Syncing filesystems ... 
-[   25.074595] PM: done.
-[   25.075035] Freezing user space processes ... (elapsed 0.002 seconds) done.
-[   25.077579] OOM killer disabled.
-[   25.078859] PM: Marking nosave pages: [mem 0x00000000-0x00000fff]
-[   25.079098] PM: Marking nosave pages: [mem 0x0009f000-0x000fffff]
-[   25.079266] PM: Basic memory bitmaps created
-[   25.079406] PM: Preallocating image memory... done (allocated 40638 pages)
-[   25.240380] PM: Allocated 162552 kbytes in 0.16 seconds (1015.95 MB/s)
-[   25.240590] Freezing remaining freezable tasks ... (elapsed 0.001 seconds) done.
-[   25.243343] Suspending console(s) (use no_console_suspend to debug)
-[   25.284901] PM: freeze of devices complete after 41.165 msecs
-[   25.286311] PM: late freeze of devices complete after 1.297 msecs
-[   25.288994] PM: noirq freeze of devices complete after 1.998 msecs
-[   25.289127] Disabling non-boot CPUs ...
-[   25.303495] smpboot: CPU 1 is now offline
-[   25.313526] smpboot: CPU 2 is now offline
-[   25.324817] smpboot: CPU 3 is now offline
-[   25.325747] PM: Creating hibernation image:
-[   25.325747] PM: Need to copy 39548 pages
-[   25.325747] PM: Normal pages needed: 39548 + 1024, available pages: 222443
-[   25.325747] PM: Hibernation image created (39548 pages copied)
-[   25.327115] Enabling non-boot CPUs ...
-[   25.327329] x86: Booting SMP configuration:
-[   25.327342] smpboot: Booting Node 0 Processor 1 APIC 0x1
-[   25.328701]  cache: parent cpu1 should not be sleeping
-[   25.331420] CPU1 is up
-[   25.331508] smpboot: Booting Node 0 Processor 2 APIC 0x2
-[   25.332197]  cache: parent cpu2 should not be sleeping
-[   25.333618] CPU2 is up
-[   25.333696] smpboot: Booting Node 0 Processor 3 APIC 0x3
-[   25.334406]  cache: parent cpu3 should not be sleeping
-[   25.335952] CPU3 is up
-[   25.339177] PM: noirq thaw of devices complete after 2.814 msecs
-[   25.340576] PM: early thaw of devices complete after 1.123 msecs
-[   25.368380] PM: thaw of devices complete after 27.740 msecs
-[   25.371921] PM: Writing image.
-[   25.502957] ata2.01: NODEV after polling detection
-[   25.509375] PM: Using 3 thread(s) for compression
-[   25.509512] PM: Compressing and saving image data (39626 pages)...
-[   25.510094] PM: Image saving progress:   0%
-[   25.657480] PM: Image saving progress:  10%
-[   25.791578] PM: Image saving progress:  20%
-[   25.935055] PM: Image saving progress:  30%
-[   26.139024] PM: Image saving progress:  40%
-[   26.324067] PM: Image saving progress:  50%
-[   26.444644] PM: Image saving progress:  60%
-[   26.585831] PM: Image saving progress:  70%
-[   26.700523] PM: Image saving progress:  80%
-[   26.837912] PM: Image saving progress:  90%
-[   26.915645] PM: Image saving progress: 100%
-[   26.917854] PM: Image saving done
-[   26.917962] PM: Wrote 158504 kbytes in 1.40 seconds (113.21 MB/s)
-[   26.919159] PM: S|
-[   27.430262] e1000: enp0s3 NIC Link is Up 1000 Mbps Full Duplex, Flow Control: RX
-[   27.955290] sd 0:0:1:0: [sdb] Synchronizing SCSI cache
-[   27.986493] sd 0:0:0:0: [sda] Synchronizing SCSI cache
-[   28.150839] reboot: Restarting system
-[   28.150989] reboot: machine restart
+[   23.566995] PM: Hibernation mode set to 'reboot'
+[   23.567748] PM: hibernation entry
+[   23.575401] PM: Syncing filesystems ... 
+[   23.616652] PM: done.
+[   23.616887] Freezing user space processes ... (elapsed 0.002 seconds) done.
+[   23.619881] OOM killer disabled.
+[   23.620861] PM: Marking nosave pages: [mem 0x00000000-0x00000fff]
+[   23.621147] PM: Marking nosave pages: [mem 0x0009f000-0x000fffff]
+[   23.621328] PM: Basic memory bitmaps created
+[   23.621635] PM: Preallocating image memory... done (allocated 41634 pages)
+[   23.770731] PM: Allocated 166536 kbytes in 0.14 seconds (1189.54 MB/s)
+[   23.770893] Freezing remaining freezable tasks ... (elapsed 0.001 seconds) done.
+[   23.817087] PM: freeze of devices complete after 43.056 msecs
+[   23.818889] PM: late freeze of devices complete after 1.571 msecs
+[   23.821630] PM: noirq freeze of devices complete after 1.983 msecs
+[   23.822018] Disabling non-boot CPUs ...
+[   23.838222] smpboot: CPU 1 is now offline
+[   23.850525] smpboot: CPU 2 is now offline
+[   23.859356] smpboot: CPU 3 is now offline
+[   23.860475] PM: Creating hibernation image:
+[   23.860475] PM: Need to copy 40759 pages
+[   23.860475] PM: Normal pages needed: 40759 + 1024, available pages: 221228
+[   23.860475] PM: Hibernation image created (40759 pages copied)
+[   23.860475] PM: Timekeeping suspended for 0.016 seconds
+[   23.861703] Enabling non-boot CPUs ...
+[   23.861974] x86: Booting SMP configuration:
+[   23.862067] smpboot: Booting Node 0 Processor 1 APIC 0x1
+[   23.863003]  cache: parent cpu1 should not be sleeping
+[   23.865729] CPU1 is up
+[   23.865912] smpboot: Booting Node 0 Processor 2 APIC 0x2
+[   23.866820]  cache: parent cpu2 should not be sleeping
+[   23.868600] CPU2 is up
+[   23.868817] smpboot: Booting Node 0 Processor 3 APIC 0x3
+[   23.869979]  cache: parent cpu3 should not be sleeping
+[   23.871933] CPU3 is up
+[   23.875432] PM: noirq thaw of devices complete after 2.855 msecs
+[   23.877200] PM: early thaw of devices complete after 1.288 msecs
+[   23.903684] PM: thaw of devices complete after 26.266 msecs
+[   23.904548] PM: Writing image.
+[   24.038334] ata2.01: NODEV after polling detection
+[   24.046073] PM: Using 3 thread(s) for compression
+[   24.046252] PM: Compressing and saving image data (40839 pages)...
+[   24.046699] PM: Image saving progress:   0%
+[   24.245191] PM: Image saving progress:  10%
+[   24.370119] PM: Image saving progress:  20%
+[   24.505850] PM: Image saving progress:  30%
+[   24.670568] PM: Image saving progress:  40%
+[   24.832371] PM: Image saving progress:  50%
+[   25.001559] PM: Image saving progress:  60%
+[   25.089819] PM: Image saving progress:  70%
+[   25.156418] PM: Image saving progress:  80%
+[   25.300744] PM: Image saving progress:  90%
+[   25.387305] PM: Image saving progress: 100%
+[   25.388528] PM: Image saving done
+[   25.388610] PM: Wrote 163356 kbytes in 1.34 seconds (121.90 MB/s)
+[   25.389384] PM: S|
+[   25.932885] e1000: enp0s3 NIC Link is Up 1000 Mbps Full Duplex, Flow Control: RX
+[   26.430319] sd 0:0:1:0: [sdb] Synchronizing SCSI cache
+[   26.478773] sd 0:0:0:0: [sda] Synchronizing SCSI cache
+[   26.708630] reboot: Restarting system
+[   26.708794] reboot: machine restart
 ```
 
 2. 开机日志
 
 ```
-[    2.898539] PM: resume from hibernation
-[    2.904409] Freezing user space processes ... (elapsed 0.000 seconds) done.
-[    2.905480] OOM killer disabled.
-[    2.905632] Freezing remaining freezable tasks ... (elapsed 0.001 seconds) done.
-[    2.926167] PM: Using 3 thread(s) for decompression
-[    2.926332] PM: Loading and decompressing image data (39626 pages)...
-[    3.421389] input: ImExPS/2 Generic Explorer Mouse as /devices/platform/i8042/serio1/input/input3
-[    3.427356] PM: Image loading progress:   0%
-[    3.924620] PM: Image loading progress:  10%
-[    4.011360] PM: Image loading progress:  20%
-[    4.103217] PM: Image loading progress:  30%
-[    4.208277] PM: Image loading progress:  40%
-[    4.280453] PM: Image loading progress:  50%
-[    4.358423] PM: Image loading progress:  60%
-[    4.426480] PM: Image loading progress:  70%
-[    4.494721] PM: Image loading progress:  80%
-[    4.567551] PM: Image loading progress:  90%
-[    4.634056] PM: Image loading progress: 100%
-[    4.635052] PM: Image loading done
-[    4.635390] PM: Read 158504 kbytes in 1.70 seconds (93.23 MB/s)
-[    4.639900] Suspending console(s) (use no_console_suspend to debug)
-[   25.284901] PM: freeze of devices complete after 41.165 msecs
-[   25.286311] PM: late freeze of devices complete after 1.297 msecs
-[   25.288994] PM: noirq freeze of devices complete after 1.998 msecs
-[   25.289127] Disabling non-boot CPUs ...
-[   25.303495] smpboot: CPU 1 is now offline
-[   25.313526] smpboot: CPU 2 is now offline
-[   25.324817] smpboot: CPU 3 is now offline
-[   25.325747] PM: Creating hibernation image:
-[   25.325747] PM: Need to copy 39548 pages
-[   25.325747] PM: Normal pages needed: 39548 + 1024, available pages: 222443
-[   25.325747] PM: Timekeeping suspended for 12.000 seconds
-[   25.345272] Enabling non-boot CPUs ...
-[   25.352589] x86: Booting SMP configuration:
-[   25.352641] smpboot: Booting Node 0 Processor 1 APIC 0x1
-[   25.366868]  cache: parent cpu1 should not be sleeping
-[   25.394680] CPU1 is up
-[   25.395264] smpboot: Booting Node 0 Processor 2 APIC 0x2
-[   25.396142]  cache: parent cpu2 should not be sleeping
-[   25.397584] CPU2 is up
-[   25.397694] smpboot: Booting Node 0 Processor 3 APIC 0x3
-[   25.398464]  cache: parent cpu3 should not be sleeping
-[   25.403158] CPU3 is up
-[   25.410674] PM: noirq restore of devices complete after 5.914 msecs
-[   25.412461] PM: early restore of devices complete after 1.040 msecs
-[   25.457623] sd 0:0:0:0: [sda] Starting disk
-[   25.457631] sd 0:0:1:0: [sdb] Starting disk
-[   25.618408] ata2.01: NODEV after polling detection
-[   25.632249] PM: restore of devices complete after 183.638 msecs
-[   25.640549] PM: Image restored successfully.
-[   25.641470] PM: Basic memory bitmaps freed
-[   25.641866] OOM killer enabled.
-[   25.642010] Restarting tasks ... done.
-[   25.664937] PM: hibernation exit
+[    2.539535] PM: Checking hibernation image partition /dev/sdb
+[    2.539921] cfg80211: failed to load regulatory.db
+[    2.540000] PM: Hibernation image partition 8:16 present
+[    2.540129] PM: Looking for hibernation image.
+[    2.541920] PM: Image signature found, resuming
+[    2.542086] PM: resume from hibernation
+[    2.547354] PM: Preparing processes for restore.
+[    2.547679] Freezing user space processes ... (elapsed 0.000 seconds) done.
+[    2.548497] OOM killer disabled.
+[    2.548631] Freezing remaining freezable tasks ... (elapsed 0.001 seconds) done.
+[    2.550616] PM: Loading hibernation image.
+[    2.551977] PM: Marking nosave pages: [mem 0x00000000-0x00000fff]
+[    2.552259] PM: Marking nosave pages: [mem 0x0009f000-0x000fffff]
+[    2.552770] PM: Basic memory bitmaps created
+[    2.566348] PM: Using 3 thread(s) for decompression
+[    2.566465] PM: Loading and decompressing image data (40839 pages)...
+[    2.953088] input: ImExPS/2 Generic Explorer Mouse as /devices/platform/i8042/serio1/input/input3
+[    2.953872] PM: Image loading progress:   0%
+[    4.314496] PM: Image loading progress:  10%
+[    4.411758] PM: Image loading progress:  20%
+[    4.539809] PM: Image loading progress:  30%
+[    4.652579] PM: Image loading progress:  40%
+[    4.725588] PM: Image loading progress:  50%
+[    4.802332] PM: Image loading progress:  60%
+[    4.884944] PM: Image loading progress:  70%
+[    4.952024] PM: Image loading progress:  80%
+[    5.027977] PM: Image loading progress:  90%
+[    5.110200] PM: Image loading progress: 100%
+[    5.110915] PM: Image loading done
+[    5.111198] PM: Read 163356 kbytes in 2.54 seconds (64.31 MB/s)
+[    5.114713] PM: Image successfully loaded
+[    5.129918] PM: quiesce of devices complete after 13.853 msecs
+[    5.132019] PM: late quiesce of devices complete after 1.887 msecs
+[    5.134512] PM: noirq quiesce of devices complete after 1.503 msecs
+[    5.134819] Disabling non-boot CPUs ...
+[   23.860475] PM: Timekeeping suspended for 11.016 seconds
+[   23.877857] Enabling non-boot CPUs ...
+[   23.884796] x86: Booting SMP configuration:
+[   23.884914] smpboot: Booting Node 0 Processor 1 APIC 0x1
+[   23.898182]  cache: parent cpu1 should not be sleeping
+[   23.922386] CPU1 is up
+[   23.923219] smpboot: Booting Node 0 Processor 2 APIC 0x2
+[   23.924188]  cache: parent cpu2 should not be sleeping
+[   23.925914] CPU2 is up
+[   23.926088] smpboot: Booting Node 0 Processor 3 APIC 0x3
+[   23.927018]  cache: parent cpu3 should not be sleeping
+[   23.930357] CPU3 is up
+[   23.940036] PM: noirq restore of devices complete after 7.004 msecs
+[   23.947919] PM: early restore of devices complete after 7.161 msecs
+[   23.991699] sd 0:0:1:0: [sdb] Starting disk
+[   23.991707] sd 0:0:0:0: [sda] Starting disk
+[   24.154510] ata2.01: NODEV after polling detection
+[   24.167581] PM: restore of devices complete after 182.923 msecs
+[   24.178294] PM: Image restored successfully.
+[   24.178974] PM: Basic memory bitmaps freed
+[   24.179269] OOM killer enabled.
+[   24.179399] Restarting tasks ... done.
+[   24.206010] PM: hibernation exit
 ```
 
 
