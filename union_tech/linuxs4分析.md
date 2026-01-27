@@ -22,25 +22,12 @@ Linux S4 流程并非纯粹的软件行为，而是一场由操作系统（OS）
 
 在acpi规范中，为了配合操作系统进行睡眠状态，定义了一些控制方法，这些方法在bios的acpi表中
 
-| 方法名称                | 作用                 |
-| ----------------------- | -------------------- |
-| _PTS (Prepare To Sleep) | 告知bios即进入睡眠， |
-|                         |                      |
-|                         |                      |
-
-
-
-##### 2.3 核心钩子函数功能对照
-
->.begin
->
->.prepare
->
->.enter
->
->.end
->
->.
+| 阶段     | ACPI 方法 | Linux 对应钩子           | 说明                                 |
+| -------- | --------- | ------------------------ | ------------------------------------ |
+| 准备进入 | _PTS      | `platform_begin`         | Prepare To Sleep。通知固件即将睡眠。 |
+| 快照前   | _GTS      | `platform_pre_snapshot`  | Going To Sleep。设置硬件唤醒使能。   |
+| 下电前   | _S4       | `acpi_hibernation_enter` | 进入 S4 对象。执行硬件寄存器写入。   |
+| 唤醒后   | _WAK      | `platform_finish`        | Wakeup。通知固件系统已回到正常状态   |
 
 #### 3. 用户态接口
 
@@ -75,16 +62,25 @@ struct platform_hibernation_ops {
     void (*recover)(void);
 };
 
-// 新的apci ops结构体
+// ACPI 休眠操作实例定义
 static const struct platform_hibernation_ops acpi_hibernation_ops = {
-    .begin = acpi_hibernation_begin, // -> acpi_pm_start - Start system PM transition   
-    .end = acpi_pm_end, // -> acpi_pm_end - Finish up system PM transition.
-    .pre_snapshot = acpi_pm_prepare, // -> acpi_pm_prepare - Prepare the platform to enter the target sleep state and disable the GPEs.
-    .finish = acpi_pm_finish, // -> acpi_pm_finish - Instruct the platform to leave a sleep state / This is called after we wake back up (or if entering the sleep state failed).
-    .prepare = acpi_pm_prepare, // -> acpi_pm_prepare - Prepare the platform to enter the target sleep state and disable the GPEs.
-    .enter = acpi_hibernation_enter, // -> acpi_enter_sleep_state 进入睡眠
+    // 准备阶段 通知 BIOS 即将开始休眠流程
+    .begin = acpi_hibernation_begin, 
+    // 结束阶段 整个休眠或恢复流程完成后的清理工作
+    .end = acpi_pm_end, 
+    // 快照前准备 关闭硬件事件响应，防止拍摄内存快照时受到干扰
+    .pre_snapshot = acpi_pm_prepare, 
+    // 流程终点 如果是恢复失败或正常唤醒，通知硬件回到工作状态
+    .finish = acpi_pm_finish, 
+    // 执行前准备 在正式断电前，最后一次确认硬件处于可关闭状态
+    .prepare = acpi_pm_prepare, 
+    // 正式休眠 向硬件寄存器写入指令，直接触发物理断电
+    .enter = acpi_hibernation_enter, 
+    // 离开休眠 硬件上电后，最初步的恢复处理
     .leave = acpi_hibernation_leave,
-    .pre_restore = acpi_pm_freeze, // -> acpi_pm_freeze - Disable the GPEs and suspend EC transactions
+    // 镜像恢复前处理 在把磁盘数据读回内存前，先冻结硬件事务
+    .pre_restore = acpi_pm_freeze, 
+    // 镜像恢复后处理 数据加载完成后，解冻并恢复硬件正常运行
     .restore_cleanup = acpi_pm_thaw,
 };
 ```
@@ -97,7 +93,7 @@ static const struct platform_hibernation_ops acpi_hibernation_ops = {
 
 整个睡眠调用大概可以分为三个阶段，第一个是准备阶段，第二个是拍摄镜像阶段，第三个是写入阶段，第四个是关机阶段
 
-###### 1) 整体调用流程
+###### 1) 进入S4的核心链路
 
 ```c
 hibernate() {
@@ -110,7 +106,7 @@ hibernate() {
 	...
 	swsusp_write();						// 写入快照
 	...
-	power_down();						// 执行关机或者刮起命令
+	power_down();						// 执行关机或者挂起命令
 }
 ```
 
@@ -145,7 +141,7 @@ create_image() {
     syscore_suspend();				// 挂起系统内核的核心设备
     save_processor_state();			// 保存特殊寄存器的状态
     ...
-	swsusp_arch_suspend(); 			// 拍摄快照
+	swsusp_arch_suspend(); 			// 拍摄快照 恢复状态的时候会从这里返回
     ...
     restore_processor_state();		// 恢复寄存器	
     platform_leave();				
@@ -257,7 +253,9 @@ state_store() {
 
 ##### 2.2 恢复代码调用
 
-```
+###### 1)  恢复代码总体调用栈
+
+```c
 software_resume() {
 	load_image_and_restore() {		// 加载镜像
         create_basic_memory_bitmaps();
@@ -366,6 +364,39 @@ ENDPROC(restore_registers)
 
 #### 5. acpi交互
 
+#### 6. 控制权交互
+
+1. OS 阶段 linux准备好镜像并保存到磁盘
+
+2. 交接点
+
+   OS 调用 acpi_enter_sleep_state(ACPI_STATE_S4)
+
+   写入 PM 寄存器，主板切断主要电源
+
+   此时，所有权属于硬件/固件电源管理模块
+
+3. 唤醒触发
+
+   用户按下电源键
+
+   **固件 (BIOS/UEFI) 取得控制权**：执行内存自检（POST），发现硬件曾处于 S4 标志位
+
+4. grub
+
+   引导程序加载内核镜像
+
+   此时内核被当作冷启动加载，直到执行 software_resume
+
+5. 控制权回归打回到OS
+
+   内核检查内核命令行参数 `resume=/dev/sdx`
+
+   内核从磁盘读取数据覆盖当前内存
+
+    调用 restore_processor_state()，代码从 swsusp_arch_suspend 的返回点继续执行
+
+   
 
 
 ### 三、实验测试
