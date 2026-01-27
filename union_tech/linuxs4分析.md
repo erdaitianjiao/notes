@@ -1,24 +1,36 @@
-### linux电源管理 s4分析报告 (基于linux4.19)
+## linux电源管理 s4分析报告 (基于linux4.19)
 
-#### 一、简介
+### 一、简介
 
-##### 1. 什么是s4
+#### 1. 什么是s4
 
 电源管理中的S4 挂载到磁盘(也称休眠)
 
 睡眠状态会将机器状态保存到交换空间，就是将内存中的内容存入交换空间、并完全关闭机器电源。机器开机后，状态会恢复。在此之前，功耗为零
 
-##### 2. ACPI (高级配置和电源接口)
+#### 2. ACPI (高级配置和电源接口)
 
 ACPI首先可以理解为一个独立于体系结构的电源管理和配置框架，它在主机OS中形成一个子系统。该框架建立一个硬件寄存器集来定义电源状态(休眠、hibernate、唤醒等)。硬件寄存器集可以容纳专用硬件和通用硬件上的操作
 
 标准ACPI框架和硬件寄存器集的主要目的是启用电源管理和系统配置，无需操作系统来直接调用固件。ACPI作为系统固件(BIOS]和OS之间的接口层	
 
-###### 2.1 协同机制
+##### 2.1 协同机制
 
-Linux S4 流程并非纯粹的软件行为，而是一场由操作系统（OS）主导、平台固件（ACPI BIOS）配合的协同演习。内核通过 `struct platform_hibernation_ops` 这一抽象接口，在关键的时间节点调用平台特定的钩子函数，确保软件状态（内存镜像）与硬件状态（寄存器、总线功率、中断环境）的一致性
+Linux S4 流程并非纯粹的软件行为，而是一场由操作系统（OS）主导、平台固件（ACPI BIOS）配合的协同演习。内核通过 `struct platform_hibernation_ops` 这一抽象接口，在关键的时间节点调用平台特定的钩子函数，确保软件状态如内存镜像与硬件状态的一致性
 
-###### 2.2 核心钩子函数功能对照
+##### 2.2 ACPI控制方法介绍
+
+在acpi规范中，为了配合操作系统进行睡眠状态，定义了一些控制方法，这些方法在bios的acpi表中
+
+| 方法名称                | 作用                 |
+| ----------------------- | -------------------- |
+| _PTS (Prepare To Sleep) | 告知bios即进入睡眠， |
+|                         |                      |
+|                         |                      |
+
+
+
+##### 2.3 核心钩子函数功能对照
 
 >.begin
 >
@@ -30,7 +42,7 @@ Linux S4 流程并非纯粹的软件行为，而是一场由操作系统（OS）
 >
 >.
 
-##### 3. 用户态接口
+#### 3. 用户态接口
 
 ```bash
 # 这里主要以reboot为例
@@ -38,9 +50,9 @@ echo reboot > /sys/power/disk
 echo disk > /sys/power/status
 ```
 
-#### 二、代码流程分析
+### 二、代码流程分析
 
-##### 1. 重要数据结构                                                                  
+#### 1. 重要数据结构                                                                  
 
 ```c
  // 实例化
@@ -79,9 +91,122 @@ static const struct platform_hibernation_ops acpi_hibernation_ops = {
 
 
 
-##### 2. 函数调用流程
+#### 2. 函数调用流程
 
-###### 2.1 睡眠调用
+##### 2.1 睡眠调用
+
+整个睡眠调用大概可以分为三个阶段，第一个是准备阶段，第二个是拍摄镜像阶段，第三个是写入阶段，第四个是关机阶段
+
+###### 1) 整体调用流程
+
+```c
+hibernate() {
+	...
+	ksys_sync();						// 同步磁盘
+	freeze_processes();					// 冻结用户线程
+	create_basic_memory_bitmaps();		// 准备阶段
+	...
+	hibernation_snapshot();				// 拍摄快照
+	...
+	swsusp_write();						// 写入快照
+	...
+	power_down();						// 执行关机或者刮起命令
+}
+```
+
+###### 2) 拍摄快照阶段调用
+
+拍摄快照的时候需要停止一切活动，防止对内存的再次修改，但是在停止活动之前要预先分配内存才存放这个镜像，提前把存储快照所需的空间预留出来，不然一旦系统静止后再发现内存不足，将没有任何机制能释放空间，导致逻辑死锁。
+
+```c
+hibernation_snapshot() {
+	platform_begin();					// 与ACPI固件的交互 _PTS调用
+	hibernate_preallocate_memory();		// 预申请内存
+	freeze_kernel_threads();			// 冻结内核线程
+	...									// 创建快照的准备部分
+	create_image();						// 执行拷贝动作
+	...
+	platform_end();						// 恢复系统的读写能力 为写入磁盘做准备
+	return;
+}
+```
+
+###### 3) 创建快照调用
+
+在create_image内部，系统经历了一个从静止到运行的转折
+
+先是继续为拍摄镜像做一个静止的环境 在拍摄完快照之后就恢复运行状态，因为接下来需要执行写入镜像和执行关机或者休眠，所以得回到运行状态才能正常写入和休眠
+
+```c
+create_image() {
+	platform_pre_snapshot();		// 调用ACPI的 _GTS方法 
+	disable_nonboot_cpus();			// 关闭CPU0以外的所有多核
+	local_irq_disable();			// 关闭中断
+    syscore_suspend();				// 挂起系统内核的核心设备
+    save_processor_state();			// 保存特殊寄存器的状态
+    ...
+	swsusp_arch_suspend(); 			// 拍摄快照
+    ...
+    restore_processor_state();		// 恢复寄存器	
+    platform_leave();				
+    syscore_resume();				// 重新激活中断控制器
+    local_irq_enable();				// 开启中断
+    enable_nonboot_cpus();			// 唤醒其他cpu
+    platform_finish();				// 后续可继续访问cpu核心 
+}
+```
+
+###### 4) 关机调用
+
+这里面有三个模式，reboot模式，休眠模式，shutdown模式
+
+1. platform模式
+
+   在断电前触发ACPI的\_PTS睡眠\_GTS等方法 调用hibernation_ops的方法
+
+   在这种模式下开机时 BIOS 会通过特定的标志位更早地识别出需要从 Swap 恢复
+
+2. shutdown模式
+
+   直接走关机流程，下次开机时，系统会像普通冷启动一样经历完整的 BIOS 自检，直到内核识别到 Swap 分区里的休眠签名才会开始恢复
+
+3. reboot模式
+
+   直接走重启流程
+
+```c
+powerdown() {
+    switch (hibernation_mode)
+        case HIBERNATION_REBOOT:
+            kernel_restart() {
+                kernel_restart_prepare();       // 通知驱动子系统即将重启，触发底层设备的关闭回调
+                migrate_to_reboot_cpu();        // 强制切换至引导核心（CPU0），确保重启指令发出的环境稳定
+                machine_restart(cmd) {
+                    native_machine_emergency_restart() {
+                        acpi_reboot();          // 绕过标准清理流程，通过 ACPI 控制寄存器直接触发硬件重置
+                    }
+                }
+            }
+        case HIBERNATION_PLATFORM:
+            hibernation_platform_enter() {
+                hibernation_ops->begin();       // 调用 ACPI 规范中的 _PTS 方法，通知硬件即将进入 S4 状态
+                hibernation_ops->prepare();     // 调用 ACPI 规范中的 _GTS 方法，进行最后的物理电平切换准备
+                disable_nonboot_cpus();         // 遵循 ACPI 协议规范，必须在单核心环境下执行状态切换
+                hibernation_ops->enter();       // 最终向 PM1_CNT 寄存器写入 S4 编码，由硬件触发断电
+            }
+        case HIBERNATION_SHUTDOWN:
+            kernel_power_off() {
+                machine_power_off() {
+                    native_machine_power_off() {
+                        // 调用在 acpi_sleep_init 中绑定的 acpi_power_off 钩子
+                        pm_power_off() -> acpi_power_off(); // 执行标准的 S5 (Soft Off) 物理关机流程
+                    }
+                }
+            }
+}
+```
+
+
 
 ```c
 state_store() {
@@ -130,7 +255,7 @@ state_store() {
 }
 ```
 
-###### 2.2 恢复代码调用
+##### 2.2 恢复代码调用
 
 ```
 software_resume() {
@@ -154,9 +279,9 @@ software_resume() {
 
 
 
-##### 3. 核心代码分析
+#### 3. 核心代码分析
 
-###### hibernation_snapshot
+##### hibernation_snapshot
 
 ```c
 int hibernation_snapshot(int platform_mode)
@@ -173,7 +298,7 @@ int hibernation_snapshot(int platform_mode)
     if (error || hibernation_test(TEST_DEVICES))
         platform_recover(platform_mode);	// 挂起失败使用acpi尝试恢复
     else 
-        error = create_image(platform_mode);	// 执行创建img指令
+        error = create_image(platform_mode);	// 执行创建img过程
     
     // 恢复的时候从这里开始执行 然后in_suspend这个变量会有区别 用于区分休眠动
     if (error || !in_suspend)	// 如果是恢复状态 就直接释放预分配的内存 因为不需要
@@ -203,7 +328,7 @@ int hibernation_snapshot(int platform_mode)
 
 
 
-##### 4. 重点逻辑分析
+#### 4. 重点逻辑分析
 
 reboot的过程是先sync然后冻结所有线程
 
@@ -212,11 +337,12 @@ reboot的过程是先sync然后冻结所有线程
 逻辑 
 
 ```c
-// kernel/power/bibernate.c 743
+// kernel/power/bibernate.c 
+int hibernate()
+...
 if (in_suspend) {
     ...
 	power_down();
-    ...
 } else {
 	pm_pr_dbg("Image restored successfully.\n");                                                       
 }
@@ -228,7 +354,7 @@ if (in_suspend) {
 在恢复部分对in_suspend变量的操作是在 
 
 ```assembly
-; arch/x86/power/hibernate_asm_64.S 143
+; arch/x86/power/hibernate_asm_64.S
 ENTRY(restore_registers)
 	... 
     movq    %rax, in_suspend(%rip)
@@ -238,23 +364,23 @@ ENDPROC(restore_registers)
 
 这里将in_suspend设置为0后，回去将能顺利执行恢复部分的代码
 
-##### 5. acpi交互
+#### 5. acpi交互
 
 
 
-#### 三、实验验证分析
+### 三、实验测试
 
 使用qumu启动debian进行hibernation的测试
 
-##### 1. 整体流程分析
+#### 1. 整体流程分析
 
 整个的流程就是<br>先sync文件系统，然后先冻结用户线程，关闭OOM killer，然后创建bitmap 记录需要保存的物理页，冻结内核线程，冻结硬件设备，关闭中断，禁用其他cpu，拍摄快照[快照]，创建镜像，启动其他cpu，开启中断，写入镜像，进入关机流程
 
 开机的时候<br>冻结用户线程，冻结内核线程，关闭OOMkiller，创建基本bitmap，加载镜像[进入快照]，启动其他cpu，开启中断，开启外设，释放bitmap内存，恢复其他线程，然后退出hibernation
 
-##### 2. 日志结果
+#### 2. 日志结果
 
-1. 关机日志
+##### 2.1 关机日志
 
 ```
 [   23.566995] PM: Hibernation mode set to 'reboot'
@@ -320,7 +446,7 @@ ENDPROC(restore_registers)
 [   26.708794] reboot: machine restart
 ```
 
-2. 开机日志
+##### 2.2 开机日志
 
 ```
 [    2.539535] PM: Checking hibernation image partition /dev/sdb
