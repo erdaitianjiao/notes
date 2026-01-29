@@ -135,7 +135,57 @@ esp寄存器是cpu栈顶指针，内核刚切换到内核态后，esp寄存器�
 
 ###### 4. 进程链表
 
-task_struct 里面包含的list_head
+task_struct 里面包含的list_head，list_head是一个双向链表，prev和next分别指向下一个和上一个task_struct元素
+
+进程链表的头是init_task描述符，是所谓的0进程或者swapper进程，init_task的prev指向的是最后插入的tasks字段
+
+```c
+for_each_process(p) // 这个宏用于遍历整个进程链表
+```
+
+###### 5. 进程之间的关系
+
+主要有父子关系和兄弟管理 进程0和1是由内核创建的 所有进程的祖先是1
+
+亲属关系字段的描述
+
+- 一些字段的说明
+
+  real_parent 创建了P进程的进程描述符，如果P进程的父进程不在存在，就指向进程1
+
+- parent 指向P进程当前的父进程，(这种进程的子进程终止时，必须向父进程发送信号)，这个值通常和real_parent相同，但是偶尔可以不同，比如被ptrace()调用请求时
+
+- children 边表的头部，链表中元素都是P创建的子进程
+
+- sibling 指向兄弟进程链表中的下一个元素或者前一个元素的指针，这些兄弟进程的父进程都是P
+
+非亲属关系的字段
+
+| **字段名**      | **说明**                                                     |
+| --------------- | ------------------------------------------------------------ |
+| group_leader    | P所在进程组的领头进程的描述符指针                            |
+| signal->pgrp    | P所在进程组的领头进程的PID                                   |
+| tgid            | P所在线程组的领头进程的PID                                   |
+| signal->session | P的登录会话领头进程的PID                                     |
+| ptrace_children | 链表的头，该链表包含所有被debugger程序跟踪的P的子进程        |
+| ptrace_list     | 指向所跟踪进程其实际父进程链表的前一个和下一个元素（用于P被跟踪的时候） |
+
+为了加速查找pid字段，引入了四个散列表，也是pidhash
+
+4个散列表和进程描述符中的相关字段
+
+| Hash表的类型 | 字段名  | 说明                |
+| ------------ | ------- | ------------------- |
+| PIDTYPE_PID  | pid     | 进程的PID           |
+| PIDTYPE_TGID | tgid    | 线程组领头进程的PID |
+| PIDTYPE_PGID | pgrp    | 进程组领头进程的PID |
+| PIDTYPE_SID  | session | 会话领头进程的PID   |
+
+linux利用链表来处理冲突pid，就像是那个邻接表
+
+![image](img/linux的pidhash.png)
+
+
 
 #### 二、内核数据结构
 
