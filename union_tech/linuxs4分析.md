@@ -22,12 +22,12 @@ Linux S4 流程并非纯粹的软件行为，而是一场由操作系统（OS）
 
 在acpi规范中，为了配合操作系统进行睡眠状态，定义了一些控制方法，这些方法在bios的acpi表中
 
-| 阶段     | ACPI 方法 | Linux 对应钩子           | 说明                                 |
-| -------- | --------- | ------------------------ | ------------------------------------ |
-| 准备进入 | _PTS      | `platform_begin`         | Prepare To Sleep。通知固件即将睡眠。 |
-| 快照前   | _GTS      | `platform_pre_snapshot`  | Going To Sleep。设置硬件唤醒使能。   |
-| 下电前   | _S4       | `acpi_hibernation_enter` | 进入 S4 对象。执行硬件寄存器写入。   |
-| 唤醒后   | _WAK      | `platform_finish`        | Wakeup。通知固件系统已回到正常状态   |
+| 阶段     | ACPI 方法  | Linux 对应钩子           | 说明                                 |
+| -------- | ---------  | ------------------------ | ------------------------------------ |
+| 准备进入 | \_PTS      | `platform_begin`         | Prepare To Sleep。通知固件即将睡眠。 |
+| 快照前   | \_GTS      | `platform_pre_snapshot`  | Going To Sleep。设置硬件唤醒使能。   |
+| 下电前   | \_S4       | `acpi_hibernation_enter` | 进入 S4 对象。执行硬件寄存器写入。   |
+| 唤醒后   | \_WAK      | `platform_finish`        | Wakeup。通知固件系统已回到正常状态   |
 
 #### 3. 用户态接口
 
@@ -102,7 +102,7 @@ hibernate() {
 	freeze_processes();					// 冻结用户线程
 	create_basic_memory_bitmaps();		// 准备阶段
 	...
-	hibernation_snapshot();				// 拍摄快照
+	hibernation_snapshot();			    // 拍摄快照
 	...
 	swsusp_write();						// 写入快照
 	...
@@ -253,7 +253,7 @@ state_store() {
 
 ##### 2.2 恢复代码调用
 
-###### 1)  恢复代码总体调用栈
+###### 1)  恢复代码调用栈
 
 ```c
 software_resume() {
