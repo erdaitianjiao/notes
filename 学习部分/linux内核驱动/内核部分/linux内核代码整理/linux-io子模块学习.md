@@ -1,10 +1,10 @@
-### linux io子模块
+# linux io子模块
 
-#### 一、VFS层
+## 一、VFS层
 
-##### 1) 结构体
+### 1) 结构体
 
-###### 1. strcut file
+#### 1. strcut file
 
 ~~~~c
 struct file {
@@ -85,7 +85,7 @@ struct file {
 
 ~~~~
 
-###### 2. struct file_operations
+#### 2. struct file_operations
 
 ~~~c
 struct file_operations {
@@ -177,7 +177,7 @@ struct file_operations {
 
 ~~~
 
-###### 3. struct inode
+#### 3. struct inode
 
 ~~~c
 struct inode {
@@ -335,7 +335,44 @@ struct inode {
 
 ~~~
 
-###### 4. struct inode_oerations
+#### 5. struct dentry
+
+~~~c
+struct dentry {
+    unsigned int d_flags;       /* 目录项标志，如 DCACHE_OP_* */
+    seqcount_spinlock_t d_seq;  /* 序列计数，用于 RCU 查找 */
+    struct hlist_bl_node d_hash;/* 哈希链表节点，用于 dentry cache */
+    struct dentry *d_parent;    /* 父目录的 dentry */
+    struct qstr d_name;         /* 目录项名称（文件名） */
+    struct inode *d_inode;      /* 关联的 inode，可能为 NULL */
+    unsigned char d_iname[32];  /* 短文件名内嵌存储 */
+
+    /* dentry 子目录链表 */
+    struct list_head d_lru;         /* LRU 链表 */
+    struct list_head d_subdirs;     /* 子目录列表 */
+    struct hlist_node d_u_alias;    /* inode alias 链表（硬链接） */
+    struct list_head d_children;    /* 子节点列表 */
+
+    /*
+     * d_alias 和 d_rcu 可以安全地用于 RCU 查找
+     */
+    union {
+        struct hlist_node d_alias;  /* inode alias 链表 */
+        struct hlist_bl_node d_in_lookup_hash;  /* lookup 时的哈希 */
+        struct callback_head d_rcu; /* RCU 回收 */
+    } d_u;
+
+    struct dentry_operations *d_op; /* dentry 操作函数 */
+    struct super_block *d_sb;      /* 所属超级块 */
+    unsigned long d_time;          /* 用于 revalidate */
+    void *d_fsdata;                /* 文件系统私有数据 */
+
+    struct list_head d_lru_alias;  /* alias LRU */
+} __randomize_layout;
+
+~~~
+
+#### 6. struct inode_operations
 
 ~~~c
 struct inode_operations {
@@ -422,7 +459,7 @@ struct inode_operations {
 
 ~~~
 
-###### 6. struct address_space
+#### 7. struct address_space
 
 ~~~c
 struct address_space {
@@ -480,7 +517,7 @@ struct address_space {
 
 ~~~
 
-###### 7. struct address_space_operations 
+#### 8. struct address_space_operations 
 
 ~~~c
 struct address_space_operations {
@@ -549,7 +586,7 @@ struct address_space_operations {
 
 ~~~
 
-###### 8.  struct page
+#### 9.  struct page
 
 ~~~c
 struct page {
@@ -630,7 +667,7 @@ struct page {
 
 ~~~
 
-###### 9. struct super_block
+#### 10. struct super_block
 
 ~~~c
 struct super_block {
@@ -692,7 +729,7 @@ struct super_block {
 
 ~~~
 
-##### 2) 结构体之间的关系
+### 2) 结构体之间的关系
 
 ~~~scss
 super_block (文件系统挂载实例)
@@ -731,13 +768,13 @@ page (内存页)
 
 ~~~
 
-###### **super_block**
+#### **super_block**
 
 - 代表挂载的整个文件系统
 - 指向根目录 `s_root`，指向所有 inode 的链表 `s_inodes`
 - inode 通过 `i_sb` 回指 `super_block`
 
-###### **inode**
+#### **inode**
 
 - 核心文件元数据（权限、大小、时间、块映射）
 - 通过 `i_mapping` 指向文件页缓存（`address_space`）
@@ -745,14 +782,16 @@ page (内存页)
 - 通过 `i_fop` 指向文件操作函数
 - 可以被多个 dentry 引用（硬链接）
 
-###### **dentry**
+#### **dentry**
 
 - VFS 路径缓存节点
 - `d_inode` 指向对应的 inode
-- 构建目录树结构，用于快速路径查找
+- `d_parent` 指向父目录
+- `d_subdirs` 管理子目录
 - `d_op` 提供操作函数
+- 构建目录树结构，用于快速路径查找
 
-**file**
+#### **file**
 
 - 打开的文件实例（进程级）
 - 每次 `open()` 会创建一个 `struct file`
@@ -761,23 +800,23 @@ page (内存页)
 - `f_path` 保存文件路径信息
 - `f_mapping` 与 inode 的 `i_mapping` 一致，用于页缓存访问
 
-###### **address_space**
+#### **address_space**
 
 - 页缓存映射表
 - 每个 inode 可能有一个 address_space
 - 保存文件内容的 page 缓存
 - 通过 `a_ops` 提供读写页的操作
 
-###### **page**
+#### **page**
 
 - 内存页
 - 通过 `mapping` 回指 address_space
 - 保存文件内容或私有数据
 - 可通过 writeback 写入磁盘
 
-##### 3) 函数
+### 3) 函数
 
-###### 1. vfs_write()
+#### 1. vfs_write()
 
 函数原型
 
@@ -838,7 +877,7 @@ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_
 
 ~~~
 
-###### 2. vfs_read()
+#### 2. vfs_read()
 
 ~~~c
 ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
@@ -898,7 +937,7 @@ ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
 
 ~~~
 
-###### 3. do_iter_readv_writev()
+#### 3. do_iter_readv_writev()
 
 ~~~c
 static ssize_t do_iter_readv_writev(struct file *filp, struct iov_iter *iter,
@@ -938,11 +977,11 @@ static ssize_t do_iter_readv_writev(struct file *filp, struct iov_iter *iter,
 
 
 
-#### 二、block层
+## 二、block层
 
-##### 2） 结构体
+### 1) 结构体
 
-###### 1. struct block_device
+#### 1. struct block_device
 
 ~~~c
 // include/linux/blk_types.h
@@ -1003,7 +1042,7 @@ struct block_device {
 } __randomize_layout;
 ~~~
 
-###### 2. struct bio
+#### 2. struct bio
 
 ~~~c
 // include/linux/blk_types.h
@@ -1071,7 +1110,7 @@ struct bio {
 };
 ~~~
 
-###### 4. struct gendisk
+#### 4. struct gendisk
 
 ~~~c
 // include/linux/blkdev.h
@@ -1161,7 +1200,7 @@ struct gendisk {
 };
 ~~~
 
-###### 5. struct request_queue
+#### 5. struct request_queue
 
 ~~~c
 
@@ -1316,7 +1355,7 @@ struct request_queue {
 };
 ~~~
 
-###### 6. struct request
+#### 6. struct request
 
 ~~~c
 /*
@@ -1440,81 +1479,25 @@ struct request {
 
 ~~~
 
-###### 7. struct bio
+### 2) 函数
+
+#### 1. submit_bio() - 提交 I/O 请求
 
 ~~~c
-// include/linux/blk_types.h
+// block/blk-core.c
+void submit_bio(struct bio *bio)
+{
+    // 检查 bio 是否有效
+    if (bio->bi_opf & REQ_NOWAIT)
+        // 非阻塞模式
+        ...
 
-/*
- * main unit of I/O for the block layer and lower layers (ie drivers and
- * stacking drivers)
- */
-struct bio {
-	struct bio		*bi_next;	/* request queue link */
-	struct block_device	*bi_bdev;
-	blk_opf_t		bi_opf;		/* bottom bits REQ_OP, top bits
-						 * req_flags.
-						 */
-	unsigned short		bi_flags;	/* BIO_* below */
-	unsigned short		bi_ioprio;
-	blk_status_t		bi_status;
-	atomic_t		__bi_remaining;
-
-	struct bvec_iter	bi_iter;
-
-	blk_qc_t		bi_cookie;
-	bio_end_io_t		*bi_end_io;
-	void			*bi_private;
-#ifdef CONFIG_BLK_CGROUP
-	/*
-	 * Represents the association of the css and request_queue for the bio.
-	 * If a bio goes direct to device, it will not have a blkg as it will
-	 * not have a request_queue associated with it.  The reference is put
-	 * on release of the bio.
-	 */
-	struct blkcg_gq		*bi_blkg;
-	struct bio_issue	bi_issue;
-#ifdef CONFIG_BLK_CGROUP_IOCOST
-	u64			bi_iocost_cost;
-#endif
-#endif
-
-#ifdef CONFIG_BLK_INLINE_ENCRYPTION
-	struct bio_crypt_ctx	*bi_crypt_context;
-#endif
-
-	union {
-#if defined(CONFIG_BLK_DEV_INTEGRITY)
-		struct bio_integrity_payload *bi_integrity; /* data integrity */
-#endif
-	};
-
-	unsigned short		bi_vcnt;	/* how many bio_vec's */
-
-	/*
-	 * Everything starting with bi_max_vecs will be preserved by bio_reset()
-	 */
-
-	unsigned short		bi_max_vecs;	/* max bvl_vecs we can hold */
-
-	atomic_t		__bi_cnt;	/* pin count */
-
-	struct bio_vec		*bi_io_vec;	/* the actual vec list */
-
-	struct bio_set		*bi_pool;
-
-	/*
-	 * We can inline a number of vecs at the end of the bio, to avoid
-	 * double allocations for a small number of bio_vecs. This member
-	 * MUST obviously be kept at the very end of the bio.
-	 */
-	struct bio_vec		bi_inline_vecs[];
-};
+    // 通过通用块层提交
+    submit_bio_noacct(bio);
+}
 ~~~
 
-
-
-###### 3. 块设备的 file_operations
+#### 2. 块设备的 file_operations
 
 ~~~c
 // block/fops.c
@@ -1537,11 +1520,11 @@ const struct file_operations def_blk_fops = {
 };
 ~~~
 
-#### 三、 映射层
+## 三、 映射层
 
-##### 1. 结构体
+### 1. 结构体
 
-###### 1) struct mapped_device
+#### 1) struct mapped_device
 
 ~~~c
 // drivers/dm-core.h
@@ -1648,9 +1631,88 @@ struct mapped_device {
 };
 ~~~
 
+#### 2) struct dm_target
 
+~~~c
+// include/linux/device-mapper.h
 
-#### 调用流程
+struct dm_target {
+	struct dm_table *table;      // 所属的 dm_table
+	struct target_type *type;    // target 类型（linear、stripe、crypt 等）
+	sector_t begin;              // target 在设备中的起始扇区
+	sector_t len;                // target 的长度（扇区数）
+
+	// target 私有数据
+	void *private;
+
+	// 性能相关
+	unsigned int num_flush_bios;
+	unsigned int num_discard_bios;
+	unsigned int num_write_zeroes_bios;
+
+	// zone 相关
+	unsigned int max_zone_append_sectors;
+
+	// 设备限制
+	struct queue_limits limits;
+
+	// 异步 I/O 支持
+	bool accounts_remapped_io:1;
+	bool flush_supported:1;
+	bool discards_supported:1;
+
+	char *error;                 // 错误信息
+};
+~~~
+
+#### 3) struct dm_table
+
+~~~c
+// drivers/md/dm.h
+
+struct dm_table {
+	struct list_head targets;    // 目标列表
+	struct mapped_device *md;    // 设备映射信息
+
+	sector_t *highs;             // 各 target 的结束位置
+	struct dm_target *targets;   // target 数组
+	unsigned int num_targets;    // target 数量
+
+	struct queue_limits limits;  // 设备限制
+	unsigned int event_nr;       // 事件计数
+	atomic_t holders;            // 引用计数
+
+	enum dm_queue_mode type;     // 设备模式
+
+	struct dm_btree_info btree_info;  // Btree 根节点
+	struct list_head devices;    // 所有使用的设备列表
+};
+~~~
+
+### 2) 函数
+
+#### 1. dm_io() - Device Mapper I/O 核心函数
+
+~~~c
+// drivers/md/dm.c
+static void dm_io(struct bio *bio)
+{
+	struct mapped_device *md = bio->bi_disk->private_data;
+
+	// 获取当前映射表
+	struct dm_table *map = dm_get_live_table(md);
+
+	// 根据 bio 的扇区位置找到对应的 target
+	struct dm_target *ti = dm_table_find_target(map, bio->bi_iter.bi_sector);
+
+	// 调用 target 的 map 函数
+	ti->type->map(ti, bio);
+
+	dm_put_table(map);
+}
+~~~
+
+## 调用流程
 
 ~~~
 用户态 write(fd, buf, count)
@@ -1667,4 +1729,121 @@ vfs_write(file, buf, count, &pos)
 file->f_op->write_iter(...)   // ext4 / blkdev / procfs
 
 ~~~
+
+### 2. 文件系统层（以 ext4 为例）
+
+~~~c
+// ext4 的 write_iter 实现
+ext4_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+  ↓
+ext4_write_checks(...)        // 权限检查
+  ↓
+generic_write_checks(...)     // 通用检查（文件锁、count限制等）
+  ↓
+// 如果是直接 I/O
+ext4_dio_write(...)
+  ↓
+// 如果是缓冲 I/O
+ext4_buffered_write(...)
+  ↓
+// 写入页缓存
+generic_perform_write(...)
+  ↓
+// 调用 address_space_operations
+a_ops->write_begin()          // 分配页
+copy_page_from_iter()         // 复制数据到页
+a_ops->write_end()            // 标记页为脏
+~~~
+
+### 3. 页缓存 → 块层
+
+```c
+// 脏页写回（writeback）
+writeback_work()
+  ↓
+// 调用 address_space_operations
+a_ops->writepages(...)
+  ↓
+// ext4 实现
+ext4_writepages(...)
+  ↓
+// 提交 bio 到块层
+submit_bio(struct bio *bio)
+~~~
+
+### 4. 块层处理
+
+```c
+submit_bio(bio)
+  ↓
+submit_bio_noacct(bio)
+  ↓
+// 如果是 request-based DM
+generic_make_request(bio)
+  ↓
+// Device Mapper 处理
+dm_io(bio)
+  ↓
+// 查找 target
+dm_table_find_target(table, sector)
+  ↓
+// 调用 target 的 map 函数（如 linear、crypt 等）
+target->type->map(ti, bio)
+  ↓
+// 重新分发 bio 到底层设备
+__clone_and_map_dm_bio(...)
+  ↓
+// 提交到底层块设备
+submit_bio_noacct(clone_bi)
+~~~
+
+### 5. 底层块设备驱动
+
+```c
+// NVMe 驱动为例
+submit_bio(bio)
+  ↓
+nvme_submit_bio(...)
+  ↓
+// 构建 request
+nvme_setup_cmd(ns, req, bd)
+  ↓
+// 提交到硬件队列
+nvme_sq_submit_cmd(...)
+  ↓
+// 写入硬件寄存器触发命令
+writeq(nvmeq->sq_dma_addr + sq->db, sq->db)
+~~~
+
+### 6. 中断完成
+
+```c
+// 硬件完成 I/O
+nvme_irq(...)
+  ↓
+// 处理完成队列
+nvme_process_cq(...)
+  ↓
+// 完成 request
+blk_complete_request(req)
+  ↓
+// 调用 bio 的完成回调
+bio->bi_end_io(bio)
+  ↓
+// 唤醒等待的进程
+wake_up_process(bio->bi_cookie)
+~~~
+
+## 五、各层总结
+
+| 层级 | 主要数据结构 | 主要函数 | 作用 |
+|------|-------------|---------|------|
+| 用户态 | fd, buf | write() | 应用程序接口 |
+| 系统调用 | - | sys_write() | 进入内核 |
+| VFS层 | struct file, inode | vfs_write() | 统一文件系统接口 |
+| 文件系统 | ext4_info, xfs_inode | ext4_file_write_iter() | 具体文件系统实现 |
+| 页缓存 | address_space, page | generic_perform_write() | 缓冲数据 |
+| 映射层 | mapped_device, dm_target | dm_io() | 逻辑设备映射 |
+| 块层 | bio, request, request_queue | submit_bio() | I/O 调度 |
+| 驱动层 | nvme_dev, queue | nvme_submit_bio() | 硬件操作 |
 
