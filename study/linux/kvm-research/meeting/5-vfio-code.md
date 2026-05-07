@@ -499,3 +499,9 @@ Guest OS 启动
 
 
 
+todo 
+1. vfio_group的字段container_next
+2. device的bar空间，PCI config space
+3. iommu和domain的关系
+4. gpu io-device的架构
+5. 
