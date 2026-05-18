@@ -1,19 +1,64 @@
 # vfio
 
 ## 一、结构体
+
 ```c
-struct vfio_devices {
-    struct device *dev;
-    const struct vfio_device_ops *ops;
-
+// 代表一个 VFIO 设备（一个 PCI 设备对应一个 vfio_device）
+struct vfio_device {
+    struct device *dev;               // 指向物理设备
+    const struct vfio_device_ops *ops;// 设备操作集
+    struct vfio_group *group;         // 所属的 IOMMU group
+    struct vfio_device_set *dev_set;  // 设备集（复位时一起复位的设备组）
+    unsigned int index;               // 设备编号
+    struct device device;             // 暴露给用户态的 device 节点
+    struct cdev cdev;                 // cdev 接口（/dev/vfio/devices/vfioX）
+    refcount_t refcount;              // 引用计数
 };
-struct 
 
+// IOMMU 隔离组，共享同一 IOMMU 页表的一组设备
+struct vfio_group {
+    struct device dev;
+    struct iommu_group *iommu_group;  // Linux IOMMU 子系统中的 group
+    struct vfio_container *container; // 绑定的 container
+    struct list_head device_list;     // 组内设备链表
+    enum vfio_group_type type;        // IOMMU / EMULATED_IOMMU / NO_IOMMU
+    struct kvm *kvm;                  // 关联的 KVM 实例
+};
 
-// 复位相关
-struct vfio_device_set {};  
+// VFIO 容器，管理 IOMMU 操作（DMA 映射入口）
+struct vfio_container {
+    struct list_head group_list;              // 包含的 group 链表
+    struct vfio_iommu_driver *iommu_driver;   // IOMMU 后端驱动
+    void *iommu_data;                         // 指向 vfio_iommu 实例
+    bool noiommu;                             // 是否无 IOMMU 模式
+};
 
-// pcie相关结构体
+// Type1 IOMMU 后端，管理所有 DMA 映射和 IOMMU domain
+struct vfio_iommu {
+    struct list_head domain_list;   // vfio_domain 链表
+    struct rb_root dma_list;        // vfio_dma 红黑树（IOVA 映射）
+    struct list_head device_list;   // 设备链表
+    uint64_t pgsize_bitmap;         // 支持的页大小
+    bool v2;                        // Type1v2
+    bool dirty_page_tracking;       // 脏页跟踪（热迁移用）
+};
+
+// VFIO 对 iommu_domain 的包装
+struct vfio_domain {
+    struct iommu_domain *domain;    // 核心：Linux IOMMU 子系统中的 domain
+                                    // 每个 domain 维护一张独立的 IOMMU 页表
+    struct list_head group_list;    // 使用这个 domain 的 group 链表
+};
+
+// 一个 DMA 映射项：记录一段 Guest 物理地址到 Host 物理地址的映射
+struct vfio_dma {
+    dma_addr_t iova;      // 设备看到的 I/O 虚拟地址（=Guest 物理地址）
+    unsigned long vaddr;  // Host 用户态虚拟地址（=QEMU 的 HVA）
+    size_t size;          // 映射大小
+    int prot;             // IOMMU_READ / IOMMU_WRITE
+};
+
+// PCI 设备的 VFIO 表示
 struct vfio_pci_core_device {
     struct vfio_device   vdev;         
     struct pci_dev       *pdev;        // PCI 设备指针
@@ -25,6 +70,84 @@ struct vfio_pci_core_device {
     // ...
 };
 ```
+### 结构体之间的关系
+
+```c
+// 两条链表：container -> group -> device
+struct vfio_container {
+    struct list_head group_list -> struct vfio_group {
+        struct list_head device_list -> struct vfio_device {
+            struct vfio_group *group;          // 指回 group
+        };
+        struct vfio_container *container;      // 指回 container
+    };
+};
+
+// iommu 链：container -> iommu -> domain -> dma
+struct vfio_container {
+    void *iommu_data -> struct vfio_iommu {
+        struct list_head domain_list -> struct vfio_domain {
+            struct iommu_domain *domain;       // Linux IOMMU 子系统
+        };
+        struct rb_root dma_list -> struct vfio_dma {
+            dma_addr_t    iova;    // 设备看到的地址(GPA)
+            unsigned long vaddr;   // QEMU 虚拟地址(HVA)
+            size_t        size;
+        };
+    };
+};
+```
+
+### IOMMU Group 划分
+
+`pci_device_group()` in `drivers/iommu/iommu.c:1603`:
+
+```c
+struct iommu_group *pci_device_group(struct device *dev)
+{
+    // 1. 处理 DMA alias
+    //    有些设备发出的请求 Requester ID 不是自己的 BDF，而是 bridge 的
+    //    比如 PCIe-to-PCI bridge 后面的设备，DMA 请求以 bridge 的 ID 发出
+    pci_for_each_dma_alias(pdev, get_pci_alias_or_group, &data);
+
+    // 2. 沿总线链往上游走，在每个桥检查 ACS
+    //    有 ACS -> break，在此刹车，不往上走
+    //    无 ACS -> 继续往上，桥本身作为新的 pdev
+    //    往上走过程中碰到已有 group -> 归入
+    for (bus = pdev->bus; !pci_is_root_bus(bus); bus = bus->parent) {
+        if (!bus->self)
+            continue;
+        if (pci_acs_path_enabled(bus->self, NULL, REQ_ACS_FLAGS))
+            break;                               // ACS 挡住，刹车
+        pdev = bus->self;                        // 没 ACS，过桥往上
+        group = iommu_group_get(&pdev->dev);
+        if (group) return group;
+    }
+
+    // 3. 查 alias 表
+    get_pci_alias_group();
+
+    // 4. 同一 slot 的不同 function 归入同一个 group
+    get_pci_function_alias_group();
+
+    // 都没找到 -> 新建 group
+    return iommu_group_alloc();
+}
+```
+
+例子：
+
+```
+Root Port
+    |          // 如果 RP 没有 ACS
+  Switch(upstream)
+   /    \       // 如果 Switch 没有 ACS
+ EP1    EP2
+```
+
+无 ACS：EP1 沿 Switch -> Root Port 走到 root bus，新建 group；EP2 同样走到 Root Port，已有 group -> 归入同一个。
+
+有 ACS（Switch 支持）：EP1 走到 Switch，ACS 通过 -> break，EP1 新建 group；EP2 同样 break，新建自己的 group。两个分到不同 group。
 
 ## 二、流程
 
@@ -188,95 +311,109 @@ vfio_device_set_group();
 
 ### qemu设备初始化
 
+qmeu的初始化流程
+1. 打开三个设备 获取fd
+2. 把group绑定到container 设置iommu类型
+3. 从group中取出device id
+4. 读取设备信息，配置空间的内容，bar的大小
+5. 把mar mmap到自己空间
+6. 创建pci设备给guest，把mmap的bar映射到guest地址空间
+
 调用栈
 ```c
 vfio_pci_realize() {
-    // 打开设备 设置group container
+    // 第一步：打开设备文件，建立 Group-Container-IOMMU 绑定
+    //  open("/dev/vfio/26"), open("/dev/vfio/vfio")
+    //  ioctl SET_CONTAINER + SET_IOMMU -> 内核创建 iommu_domain
+    //  ioctl GET_DEVICE_FD -> 拿到 device fd
     vfio_device_attach() {
         vfio_device_attach_by_iommu_type() {
-            ops->attach_device(); // 两种可能
-            // Legacy路径
+            ops->attach_device(); // 两种可能：LEGACY 和 IOMMUFD
+            // Legacy路径：/dev/vfio/vfio + /dev/vfio/$GROUPID，group 中心模型
             vfio_legacy_attach_device() {
+                // 从 sysfs 读 iommu_group 链接拿到 groupid
+                vfio_device_get_groupid();
+                // 打开 /dev/vfio/26，检查 viable，连接 container
                 vfio_group_get() {
                     vfio_container_connect() {
+                        // 先尝试复用已有 container
+                        // ioctl(group_fd, VFIO_GROUP_SET_CONTAINER, &existing_fd)
+                        // 没有就 open("/dev/vfio/vfio") 创建新的
                         vfio_create_container() {
+                            // 探测 IOMMU 类型：TYPE1v2 -> TYPE1
+                            vfio_get_iommu_type();
+                            // ioctl SET_CONTAINER：group 绑 container
+                            // ioctl SET_IOMMU：创建 vfio_iommu，分配 iommu_domain
                             vfio_set_iommu();
                         }
+                        // group->container = container, 挂入 group_list
                         vfio_container_group_add();
+                        // 注册 MemoryListener，Guest 内存变化时自动调 DMA_MAP
+                        vfio_listener_register();
                     }
                 }
+                // ioctl(group_fd, VFIO_GROUP_GET_DEVICE_FD) -> device fd
+                // ioctl(device_fd, VFIO_DEVICE_GET_INFO) -> num_regions/irqs
                 vfio_device_get();
             }
-            // Iommufd
+            // IOMMUFD路径：/dev/iommufd + cdev，device 中心模型
         }
     }
-    // 从内核获取region信息 bar大小等
+
+    // 第二步：遍历 BAR0~ROM，ioctl VFIO_DEVICE_GET_REGION_INFO
+    // 拿到每个 BAR 的 size/offset/flags -> region.size/fd_offset/flags
+    // 创建 region.mem（IO 型 MR 容器，ops 为 vfio_region_ops）
+    // 如果支持 mmap，解析 sparse mmap 区间到 region->mmaps[]
     vfio_pci_populate_device();
     
-    // 读配置空间，准备Bar 注册bar mmap bar
+    // 第三步：读配置空间 + 判断 BAR 类型 + 注册 BAR + mmap
     vfio_pci_config_setup() {
-        // 遍历bar
-        vfio_region_setup() {
-            // ioctl获取region大小 偏移 flag
-            vfio_device_get_region_info();
-            // 创建iobar
-            memory_region_init_io();
-
-            if (region->flags & VFIO_REGION_INFO_FLAG_MMAP) {
-                // 如果支持mmap 计算mmap区间
-                vfio_setup_region_sparse_mmaps(region, info, errp);
-            }
-
-        }
-    }
-    vfio_pci_config_setup() {
-        // 读取设备空间
+        // pread(device_fd, config_offset) 读整个配置空间到 pdev->config
         vfio_pci_config_space_read();
-        // 设置模拟位
 
-        // 读原始bar的值，判断类型
+        // 设置模拟位掩码 emulated_config_bits[]
+        // BAR 地址清0（Guest BIOS 会重新分配）
+        // MSI/MSI-X Cap 标记为模拟（不暴露 host APIC 地址给 Guest）
+        // Interrupt Pin 标记为模拟
+        memset(&pdev->config[PCI_BASE_ADDRESS_0], 0, 24);
+        memset(&pdev->config[PCI_ROM_ADDRESS], 0, 4);
+
+        // 读每个 BAR 的原始值，判断 IO/MEM/64bit 类型
+        // bit0=1 -> IO BAR（独立 I/O 空间，x86 共 64KB），bit0=0 -> MEM BAR
+        // bit[2:1]=10 -> 64bit MEM BAR（需要2个BAR寄存器拼地址）
         vfio_bars_prepare() {
-            // for each bar
             vfio_bar_prepare() {
-                // 读取bar原始值 
                 vfio_pci_config_space_read();
-                // 判断类型
-                pci_bar = le32_to_cpu(pci_bar);
                 bar->ioport = (pci_bar & PCI_BASE_ADDRESS_SPACE_IO);
                 bar->mem64 = bar->ioport ? 0 : (pci_bar & PCI_BASE_ADDRESS_MEM_TYPE_64);
                 bar->type = pci_bar & (bar->ioport ? ~PCI_BASE_ADDRESS_IO_MASK :
-                                                    ~PCI_BASE_ADDRESS_MEM_MASK);
+                                                     ~PCI_BASE_ADDRESS_MEM_MASK);
             }
         }
 
-        // 注册bar 创建mr层次
+        // 创建三层 MR -> mmap -> 注册 PCI BAR
         vfio_bars_register() {
-            // for each bar
             vfio_bar_register() {
-                // 创建io形bar
-                bar->mr = g_new0();
+                // bar->mr: IO 型顶层容器，ops=NULL，不自己处理访问
                 memory_region_init_io();
                 
-                if (bar->region.size) {
-                    // 把region.mem 挂在 bar-mr下面
-                    memory_region_add_subregion();
+                // 把之前创建的 region.mem 挂到 bar->mr 下面
+                // region.mem 是 IO 型，用 vfio_region_ops -> pread/pwrite（慢速fallback）
+                memory_region_add_subregion();
 
-                    // 真正的mmp
-                    vfio_region_mmap(&bar->region) {
-                        map_base = mmap(); // 分配一个空间
-                        // 获取region对应的fd
-                        fd = vfio_device_get_region_fd();
-                        // for each mem 逐段映射
-                        region->mmaps[i].mmap = mmap();
-
-                        // 用mmap创建出来的mmp 创建ram形mr
-                        // kvm会为其建立ept页表，guset可以直接访问
-                        memory_region_init_ram_device_ptr();
-                    }
+                // 真正的 mmap
+                vfio_region_mmap() {
+                    // 匿名映射做对齐
+                    map_base = mmap();
+                    fd = vfio_device_get_region_fd();
+                    // MAP_SHARED | MAP_FIXED，写 QEMU VA 直接到设备 BAR 物理地址
+                    region->mmaps[i].mmap = mmap();
+                    // RAM 型 MR 指向 mmap 出来的物理内存
+                    // KVM 建立 EPT 页表，Guest 访问时 EPT: GPA->HPA，没有 VM exit
+                    memory_region_init_ram_device_ptr();
                 }
-                // 向pci核心注册这个bar
-                pci_register_bar(pdev, nr, bar->type, bar->mr);
-
+                // 注册到 QEMU PCI 核心，Guest BIOS 枚举时可见
+                pci_register_bar();
             }
         }
     }
