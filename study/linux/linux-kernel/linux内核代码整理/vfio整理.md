@@ -191,6 +191,7 @@ vfio_device_set_group();
 调用栈
 ```c
 vfio_pci_realize() {
+    // 打开设备 设置group container
     vfio_device_attach() {
         vfio_device_attach_by_iommu_type() {
             ops->attach_device(); // 两种可能
@@ -209,7 +210,76 @@ vfio_pci_realize() {
             // Iommufd
         }
     }
+    // 从内核获取region信息 bar大小等
     vfio_pci_populate_device();
+    
+    // 读配置空间，准备Bar 注册bar mmap bar
+    vfio_pci_config_setup() {
+        // 遍历bar
+        vfio_region_setup() {
+            // ioctl获取region大小 偏移 flag
+            vfio_device_get_region_info();
+            // 创建iobar
+            memory_region_init_io();
+
+            if (region->flags & VFIO_REGION_INFO_FLAG_MMAP) {
+                // 如果支持mmap 计算mmap区间
+                vfio_setup_region_sparse_mmaps(region, info, errp);
+            }
+
+        }
+    }
+    vfio_pci_config_setup() {
+        // 读取设备空间
+        vfio_pci_config_space_read();
+        // 设置模拟位
+
+        // 读原始bar的值，判断类型
+        vfio_bars_prepare() {
+            // for each bar
+            vfio_bar_prepare() {
+                // 读取bar原始值 
+                vfio_pci_config_space_read();
+                // 判断类型
+                pci_bar = le32_to_cpu(pci_bar);
+                bar->ioport = (pci_bar & PCI_BASE_ADDRESS_SPACE_IO);
+                bar->mem64 = bar->ioport ? 0 : (pci_bar & PCI_BASE_ADDRESS_MEM_TYPE_64);
+                bar->type = pci_bar & (bar->ioport ? ~PCI_BASE_ADDRESS_IO_MASK :
+                                                    ~PCI_BASE_ADDRESS_MEM_MASK);
+            }
+        }
+
+        // 注册bar 创建mr层次
+        vfio_bars_register() {
+            // for each bar
+            vfio_bar_register() {
+                // 创建io形bar
+                bar->mr = g_new0();
+                memory_region_init_io();
+                
+                if (bar->region.size) {
+                    // 把region.mem 挂在 bar-mr下面
+                    memory_region_add_subregion();
+
+                    // 真正的mmp
+                    vfio_region_mmap(&bar->region) {
+                        map_base = mmap(); // 分配一个空间
+                        // 获取region对应的fd
+                        fd = vfio_device_get_region_fd();
+                        // for each mem 逐段映射
+                        region->mmaps[i].mmap = mmap();
+
+                        // 用mmap创建出来的mmp 创建ram形mr
+                        // kvm会为其建立ept页表，guset可以直接访问
+                        memory_region_init_ram_device_ptr();
+                    }
+                }
+                // 向pci核心注册这个bar
+                pci_register_bar(pdev, nr, bar->type, bar->mr);
+
+            }
+        }
+    }
 }
 
 ```
@@ -484,7 +554,7 @@ static bool vfio_device_get(VFIOGroup *group, const char *name,
     // 填充 vbasedev
     vfio_device_prepare(vbasedev, VFIO_IOMMU(group->container), info);
 
-    vbasedev->fd = fd
+    vbasedev->fd = fd;
     vbasedev->group = group;
     QLIST_INSERT_HEAD(&group->device_list, vbasedev, next);
     return true;
@@ -497,7 +567,5 @@ static bool vfio_device_get(VFIOGroup *group, const char *name,
 ```c
 // QEMU
 vfio_pci_read_config();
-
-
 
 ```
