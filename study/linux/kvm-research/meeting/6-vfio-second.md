@@ -138,3 +138,269 @@ R-IOV架构包含两个功能：
 
 ## vfio整理
 
+
+### 结构体之间的关系
+
+```c
+// 两条链表：container -> group -> device
+struct vfio_container {
+    struct list_head group_list -> struct vfio_group {
+        struct list_head device_list -> struct vfio_device {
+            struct vfio_group *group;          // 指回 group
+        };
+        struct vfio_container *container;      // 指回 container
+    };
+};
+
+// iommu 链：container -> iommu -> domain -> dma
+struct vfio_container {
+    void *iommu_data -> struct vfio_iommu {
+        struct list_head domain_list -> struct vfio_domain {
+            struct iommu_domain *domain;       // Linux IOMMU 子系统
+        };
+        struct rb_root dma_list -> struct vfio_dma {
+            dma_addr_t    iova;    // 设备看到的地址(GPA)
+            unsigned long vaddr;   // QEMU 虚拟地址(HVA)
+            size_t        size;
+        };
+    };
+};
+```
+
+
+
+### 流程
+
+#### 初始化函数
+内核初始化vfio驱动的时候会地用这个函数
+```c
+int __init vfio_pci_init(void)
+{
+    int ret;
+    is_diable_vga = disable_vga
+
+    // 设置了几个参数，应该是关于 vga 和 idle的
+    vfio_pci_core_set_params(nointxmask, is_disable_vga, disable_idle_d3);
+
+    // 注册 PCI 驱动，触发 probe 所有匹配的设备
+    ret = pci_register_driver(&vfio_pci_driver);
+
+    vfio_pci_fill_ids();
+
+    return ret;
+}
+
+// pci结构体定义
+static struct pci_driver vfio_pci_driver = {
+    .name           = "vfio-pci",
+    .id_table       = vfio_pci_table,       // 匹配的pci的表
+    .probe          = vfio_pci_probe,       // Probe函数，有新的pci的设备后会调用
+    .remove         = vfio_pci_remove,
+    .sriov_configure    = vfio_pci_sriov_configure,
+    .err_handler        = &vfio_pci_core_err_handlers,
+    .driver_managed_dma = true,
+};
+```
+
+#### probe函数
+设备被vfio-pci绑定的时候调用
+
+```c
+static int vfio_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+    struct vfio_pci_core_device *vdev;
+    int ret;
+
+    // 检查是否在拒绝列表中
+    if (vfio_pci_is_denylisted(pdev))
+        return -EINVAL;
+
+    // 分配一个 vfio_device
+    vdev = vfio_alloc_device(vfio_pci_core_device, vdev, &pdev->dev,
+                 &vfio_pci_ops);
+
+    dev_set_drvdata(&pdev->dev, vdev);
+    vdev->pci_ops = &vfio_pci_dev_ops;
+
+    // 注册设备到vfio框架
+    ret = vfio_pci_core_register_device(vdev);
+    if (ret)
+        goto out_put_vdev;
+    return 0;
+
+out_put_vdev:
+    vfio_put_device(&vdev->vdev);
+    return ret;
+}
+
+```
+
+#### 核心注册
+```c
+int vfio_pci_core_register_device(struct vfio_pci_core_device *vdev)
+{
+    struct pci_dev *pdev = vdev->pdev;
+    struct device *dev = &pdev->dev;
+    int ret;
+
+    // 分配设备集 (用于复位管理)
+    if (pci_is_root_bus(pdev->bus) || pdev->is_virtfn) {
+        // 在 root上 或者是 sr-iov 中的 vf
+        ret = vfio_assign_device_set(&vdev->vdev, vdev);  
+    } else if (!pci_probe_reset_slot(pdev->slot)) {
+        // 如果在某个slot上
+        ret = vfio_assign_device_set(&vdev->vdev, pdev->slot);  
+    } else {
+        // 没有slot就整个pcie bus
+        ret = vfio_assign_device_set(&vdev->vdev, pdev->bus);  
+    }
+
+    // 初始化 VF 和 VGA
+    ret = vfio_pci_vf_init(vdev);  
+    ret = vfio_pci_vga_init(vdev);  
+
+    //  注册到 VFIO group
+    ret = vfio_register_group_dev(&vdev->vdev);  
+    if (ret)
+        goto out_power;
+    return 0;
+}
+
+int vfio_register_group_dev(struct vfio_device *device)
+{
+    return __vfio_register_dev(device, VFIO_IOMMU);
+}
+```
+
+#### vfio核心注册
+```c
+static int __vfio_register_dev(struct vfio_device *device,
+                                enum vfio_group_type type)
+{
+    int ret;
+
+    // 设置设备名称
+    ret = dev_set_name(&device->device, "vfio%d", device->index);
+
+    // 核心 设置 group，创建 /dev/vfio/$GROUP_ID
+    ret = vfio_device_set_group(device, type);
+    if (ret)
+        return ret;
+
+    // 添加设备到设备模型，创建 /dev/vfio/devices/...
+    ret = vfio_device_add(device);
+
+    // 注册到 group
+    vfio_device_group_register(device);
+
+    return 0;
+}
+
+```
+
+#### 手动解绑和绑定设备过程
+
+手动解绑的sysfs接口
+```bash
+cat /sys/bus/pci/devices/0000:01:00:0/driver/module
+
+echo 0000:01:00:0 > /sys/bus/pci/driver/xxx/unbind
+
+echo 0000:01:00:0 > /sys/bus/pco/drivers/vfio-pci/bind
+```
+
+- 绑定时候触发的流程
+
+```c
+driver_probe_device();
+vfio_pci_probe();
+vfio_pcie_core_register_device();
+vfio_register_group_dev();
+vfio_device_set_group();
+```
+然后会在/dev下创建 /dev/vfio/$group_id /dev/vfio/devices/vfioX
+
+- 节点说明
+/dev/vfio/vfio container节点
+/dev/vfio/1    Group设备
+/dev/vfio/devices/vfio0  设备文件
+
+#### qemu设备初始化
+
+qmeu的初始化流程
+1. 打开三个设备 获取fd
+2. 把group绑定到container 设置iommu类型
+3. 从group中取出device id
+4. 读取设备信息，配置空间的内容，bar的大小
+5. 把mar mmap到自己空间
+6. 创建pci设备给guest，把mmap的bar映射到guest地址空间
+
+调用栈
+```c
+vfio_pci_realize() {
+    // 第一步：打开设备，绑定 group-container，设置 IOMMU
+    vfio_device_attach() {
+        vfio_device_attach_by_iommu_type() {
+            ops->attach_device(); // LEGACY 或 IOMMUFD
+            // Legacy 路径：/dev/vfio/vfio + /dev/vfio/$GROUPID
+            vfio_legacy_attach_device() {
+                vfio_device_get_groupid();   // sysfs 读 groupid
+                vfio_group_get() {
+                    // open("/dev/vfio/26"), 检查 viable
+                    vfio_container_connect() {
+                        // 先试复用：ioctl SET_CONTAINER &existing_fd
+                        // 没有则 open("/dev/vfio/vfio")
+                        vfio_create_container() {
+                            vfio_get_iommu_type(); // TYPE1v2 -> TYPE1
+                            vfio_set_iommu() {
+                                // ioctl SET_CONTAINER + SET_IOMMU
+                                // alloc vfio_iommu, dma_list=RB_ROOT
+                                // container->iommu_data = vfio_iommu
+                                // attach_group: 分配 vfio_domain, 申请 iommu_domain
+                            }
+                        }
+                        vfio_container_group_add(); // group 挂入 container
+                        vfio_listener_register();   // DMA 映射监听
+                    }
+                }
+                vfio_device_get() {
+                    // ioctl GET_DEVICE_FD, GET_DEVICE_INFO
+                }
+            }
+        }
+    }
+
+    // 第二步：遍历 BAR，ioctl GET_REGION_INFO 拿 size/offset/flags
+    // 创建 region.mem，解析 sparse mmap 区间到 region->mmaps[]
+    vfio_pci_populate_device();
+    
+    // 第三步：读配置空间，判断 BAR 类型，注册 BAR + mmap
+    vfio_pci_config_setup() {
+        vfio_pci_config_space_read(); // pread 读配置空间
+
+        // BAR 地址清0，MSI/MSI-X 标为模拟
+        memset(&pdev->config[PCI_BASE_ADDRESS_0], 0, 24);
+
+        vfio_bars_prepare() {
+            vfio_bar_prepare() {
+                vfio_pci_config_space_read();
+                bar->ioport = (pci_bar & PCI_BASE_ADDRESS_SPACE_IO); // bit0
+                bar->mem64 = (pci_bar & PCI_BASE_ADDRESS_MEM_TYPE_64); // bit[2:1]
+            }
+        }
+
+        vfio_bars_register() {
+            vfio_bar_register() {
+                memory_region_init_io();       // bar->mr, IO 型顶层
+                memory_region_add_subregion(); // region.mem 挂到 bar->mr 下
+                vfio_region_mmap() {
+                    mmap(fd, MAP_SHARED, ...);           // 设备 BAR -> QEMU VA
+                    memory_region_init_ram_device_ptr(); // RAM 型 MR -> EPT
+                }
+                pci_register_bar(); // Guest 可见
+            }
+        }
+    }
+}
+
+```
