@@ -13,13 +13,13 @@ todo
 ### 1. contianer_next
 ```c
 int vfio_container_attach_group(struct vfio_container *container,
-				struct vfio_group *group)
+                struct vfio_group *group)
 {
     ...
-	group->container = container;
-	group->container_users = 1;
+    group->container = container;
+    group->container_users = 1;
     ...
-	list_add(&group->container_next, &container->group_list);
+    list_add(&group->container_next, &container->group_list);
     ...
 }
 ```
@@ -47,7 +47,7 @@ PCIe上连接的设备可以分为两种类型
 1. Type 0：Endpoint 它表示一个PCIe上最终端的设备，比如我们常见的显卡，声卡，网卡等等
 2. Type 1：它表示一个PCIe Switch或者Root Port，它的主要作用是用来连接其他的PCIe设备
 
-### BDF（Bus Number, Device Number, Function Number）
+### BDF (Bus Number, Device Number, Function Number)
 
 每个pcie都有一个配置空间，内核通过读取这个知道设备的类型
 
@@ -166,8 +166,6 @@ struct vfio_container {
     };
 };
 ```
-
-
 
 ### 流程
 
@@ -332,7 +330,7 @@ qmeu的初始化流程
 2. 把group绑定到container 设置iommu类型
 3. 从group中取出device id
 4. 读取设备信息，配置空间的内容，bar的大小
-5. 把mar mmap到自己空间
+5. 把bar mmap到用户态空间
 6. 创建pci设备给guest，把mmap的bar映射到guest地址空间
 
 调用栈
@@ -404,3 +402,8 @@ vfio_pci_realize() {
 }
 
 ```
+
+
+bar 和 bar空间和配置空间
+ace 的 device id table 存放 and bar
+把bar mmap到自己空间 是 bar本身还是 bar映射的空间
