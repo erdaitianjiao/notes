@@ -405,5 +405,5 @@ vfio_pci_realize() {
 
 
 bar 和 bar空间和配置空间
-ace 的 device id table 存放 and bar
+acs 的 device id table 存放 and bar
 把bar mmap到自己空间 是 bar本身还是 bar映射的空间
