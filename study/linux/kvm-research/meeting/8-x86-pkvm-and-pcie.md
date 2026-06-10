@@ -761,3 +761,17 @@ v6.12 的 ptdev.c/h、pci.c/h、nested.c/h、vmexit.c/h、io_emulate.c/h 全部�
 ```
 
 13. 10个SQUASHME commit：表明多个功能仍为临时实现，未最终定稿
+
+
+https://atomgit.com/openeuler/kernel/tree/openEuler-24.03-LTS_SP3
+https://github.com/intel-staging/pKVM-IA/tree/pkvm-v6.18
+## todo
+- vmcs 大概看一下
+- 基于linux6.18
+1. 移植到openelur 6.6 kernel，pkvm的所有功能
+2. pathch 在6.18 mainline 后的所有 
+3. 在6.6.到 6.18 之间的pkvm相关的patch
+4. pkvm 依赖 其他的一些patch
+
+一般测试 os 完备性
+
